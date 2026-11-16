@@ -65,7 +65,7 @@ impl Discussions {
     pub async fn post(&self, p: &Post) -> Result<()> {
         p.validate()?;
         anyhow::ensure!(
-            self.get(&p.discussion).await?.is_some(),
+            self.exists(&p.discussion).await?,
             "no discussion `{}`",
             p.discussion
         );
@@ -118,6 +118,20 @@ impl Discussions {
         Ok(out)
     }
 
+    /// Whether `id` names a discussion: one lookup of its `discussion.json`.
+    async fn exists(&self, id: &str) -> Result<bool> {
+        let id = id.trim();
+        if id.is_empty() || id.contains('/') {
+            return Ok(false);
+        }
+        let key = self.root.clone().join(id).join("discussion.json");
+        match self.store.head(&key).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(e).with_context(|| format!("look up discussion {key}")),
+        }
+    }
+
     pub async fn all(&self) -> Result<Vec<Transcript>> {
         self.read(&self.root).await
     }
@@ -136,20 +150,32 @@ impl Discussions {
     }
 }
 
-/// What `on` names, as anchors: a file by its repo-relative path, else the symbol `lookup` finds.
+/// What `on` names, as anchors: a file of `repo` by its path, else the symbol `lookup` finds.
 pub fn anchors<'a>(
     g: &CodeGraph,
     symbols: impl Iterator<Item = &'a Symbol> + Clone,
+    repo: &str,
     on: &[String],
     commits: &HashMap<String, String>,
 ) -> Result<Vec<Anchor>> {
     let mut out = Vec::new();
     for focus in on.iter().map(|f| f.trim()).filter(|f| !f.is_empty()) {
-        let file = symbols.clone().find(|s| {
-            s.kind == SymbolKind::File
-                && (s.file_path == focus || focus.ends_with(&format!("/{}", s.file_path)))
-        });
-        let s = match file {
+        let files = symbols
+            .clone()
+            .filter(|s| s.kind == SymbolKind::File && s.repo.0.eq_ignore_ascii_case(repo));
+        let exact: Vec<&Symbol> = files.clone().filter(|s| s.file_path == focus).collect();
+        let found = if exact.is_empty() {
+            files
+                .filter(|s| focus.ends_with(&format!("/{}", s.file_path)))
+                .collect()
+        } else {
+            exact
+        };
+        anyhow::ensure!(
+            found.len() < 2,
+            "`{focus}` matches more than one file in `{repo}`; give the full path"
+        );
+        let s = match found.first().copied() {
             Some(s) => s,
             None => {
                 let id = g.lookup(focus).map(|i| g.node(i).id).with_context(|| {
@@ -308,6 +334,50 @@ mod tests {
         assert!(err.contains("no discussion"), "{err}");
         assert!(empty_err, "an empty id names no discussion");
         assert!(prefix.is_none(), "only the exact id finds a discussion");
+    }
+
+    fn file(repo: &str, path: &str) -> Symbol {
+        use crate::model::{GlobalSymbolId, Language, Position, Range, RepoId};
+        Symbol {
+            id: GlobalSymbolId {
+                scheme: "t".into(),
+                package_manager: ".".into(),
+                package: repo.into(),
+                version: ".".into(),
+                descriptor: format!("{path}/"),
+            },
+            name: path.into(),
+            kind: SymbolKind::File,
+            language: Language::Rust,
+            repo: RepoId(repo.into()),
+            file_path: path.into(),
+            range: Range {
+                start: Position { line: 0, column: 0 },
+                end: Position { line: 1, column: 0 },
+            },
+            signature: None,
+            docstring: None,
+            fingerprint: None,
+        }
+    }
+
+    #[test]
+    fn file_anchors_stay_in_the_discussions_repository() {
+        let symbols = [
+            file("api", "src/main.rs"),
+            file("web", "src/main.rs"),
+            file("web", "a/src/main.rs"),
+        ];
+        let g = CodeGraph::build(&symbols, &[]);
+        let on =
+            |repo: &str, f: &str| anchors(&g, symbols.iter(), repo, &[f.into()], &HashMap::new());
+        for repo in ["api", "web"] {
+            let got = on(repo, "src/main.rs").unwrap();
+            assert_eq!(got[0].repo, repo);
+        }
+        assert_eq!(on("web", "a/src/main.rs").unwrap()[0].path, "a/src/main.rs");
+        let err = on("web", "x/a/src/main.rs").unwrap_err().to_string();
+        assert!(err.contains("more than one file"), "{err}");
     }
 
     #[test]

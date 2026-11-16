@@ -125,20 +125,20 @@ impl ComindlyServer {
                 Ok(d::list_markdown(&d::search(&all, &q)))
             }
             "open" | "post" => {
-                Self::may_write(ctx)?;
+                Self::may_write(ctx, "write to discussions")?;
                 let by = self.agent(ctx);
                 let commits = crate::index::read_repo_commits(&self.uri)
                     .await
                     .unwrap_or_default();
-                let anchors = d::anchors(&self.graph, self.symbols.values(), &p.on, &commits)?;
                 let teams = self.team_settings();
-                let (id, existing) = if action == "open" {
+                let body = p.body.unwrap_or_default();
+                // Everything is checked before anything is written, so a refused open leaves nothing behind.
+                let (repo, opening) = if action == "open" {
                     let repo = p.repo.context("`open` needs the `repo` the work is in")?;
                     anyhow::ensure!(
                         self.symbols.values().any(|s| s.repo.0 == repo),
                         "no indexed repository `{repo}`"
                     );
-                    teams.accepts(&by.teams, &[repo.as_str()])?;
                     let title = p.title.context("`open` needs a `title`")?;
                     let new = d::Discussion::new(
                         &repo,
@@ -147,21 +147,39 @@ impl ComindlyServer {
                         &title,
                         by.clone(),
                     );
-                    store.start(&new).await?
+                    new.validate()?;
+                    (repo, Some(new))
                 } else {
-                    (p.id.context("`post` needs the discussion's `id`")?, true)
-                };
-                let body = p.body.unwrap_or_default();
-                if action == "post" || !body.trim().is_empty() {
+                    let id = p.id.clone().context("`post` needs the discussion's `id`")?;
                     let t = store
                         .get(&id)
                         .await?
                         .with_context(|| format!("no discussion `{id}`"))?;
-                    let mut repos: Vec<&str> = anchors.iter().map(|a| a.repo.as_str()).collect();
-                    repos.push(&t.discussion.repo);
-                    teams.accepts(&by.teams, &repos)?;
-                    let post = d::new_post(&id, p.kind.as_deref(), &body, p.evidence, anchors, by)?;
-                    store.post(&post).await?;
+                    (t.discussion.repo, None)
+                };
+                let anchors =
+                    d::anchors(&self.graph, self.symbols.values(), &repo, &p.on, &commits)?;
+                let mut repos: Vec<&str> = anchors.iter().map(|a| a.repo.as_str()).collect();
+                repos.push(&repo);
+                teams.accepts(&by.teams, &repos)?;
+                let target = opening
+                    .as_ref()
+                    .map_or(p.id.as_deref().unwrap_or_default(), |n| n.id.as_str());
+                let mut post = if opening.is_none() || !body.trim().is_empty() {
+                    let post =
+                        d::new_post(target, p.kind.as_deref(), &body, p.evidence, anchors, by)?;
+                    post.validate()?;
+                    Some(post)
+                } else {
+                    None
+                };
+                let (id, existing) = match &opening {
+                    Some(new) => store.start(new).await?,
+                    None => (target.to_string(), true),
+                };
+                if let Some(post) = post.as_mut() {
+                    post.discussion = id.clone();
+                    store.post(post).await?;
                 }
                 Ok(match (action, existing) {
                     ("post", _) => format!("posted to discussion `{id}`"),
@@ -223,13 +241,16 @@ impl ComindlyServer {
     /// The calling agent, from its MCP handshake unless named; over HTTP on a server, working for
     /// the member whose token it uses.
     /// Viewers' agents read; writing to the ledger needs a member.
-    fn may_write(ctx: &rmcp::service::RequestContext<rmcp::RoleServer>) -> anyhow::Result<()> {
+    fn may_write(
+        ctx: &rmcp::service::RequestContext<rmcp::RoleServer>,
+        what: &str,
+    ) -> anyhow::Result<()> {
         let viewer = ctx
             .extensions
             .get::<axum::http::request::Parts>()
             .and_then(|parts| parts.extensions.get::<crate::server::Who>())
             .is_some_and(|w| !w.role.at_least(crate::server::Role::Member));
-        anyhow::ensure!(!viewer, "viewers can read, not write to the ledger");
+        anyhow::ensure!(!viewer, "viewers can read, not {what}");
         Ok(())
     }
 
@@ -1241,7 +1262,7 @@ impl ComindlyServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<RememberParam>,
     ) -> CallToolResult {
-        let result = match Self::may_write(&ctx) {
+        let result = match Self::may_write(&ctx, "write to the ledger") {
             Ok(()) => self.write_record(p, self.agent(&ctx)).await,
             Err(e) => Err(e),
         };
@@ -1280,7 +1301,7 @@ impl ComindlyServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ReviewParam>,
     ) -> CallToolResult {
-        let result = match Self::may_write(&ctx) {
+        let result = match Self::may_write(&ctx, "write to the ledger") {
             Ok(()) => self.write_review(p, self.agent(&ctx)).await,
             Err(e) => Err(e),
         };

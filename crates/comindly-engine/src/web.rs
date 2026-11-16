@@ -1736,8 +1736,6 @@ async fn discussion_open(
             "no indexed repository `{}`",
             b.repo
         );
-        let teams = s.teams.read().unwrap_or_else(|e| e.into_inner()).clone();
-        teams.accepts(&by.teams, &[b.repo.as_str()])?;
         let store = crate::discussion::Discussions::open(root)?;
         let new = crate::discussion::Discussion::new(
             &b.repo,
@@ -1746,20 +1744,32 @@ async fn discussion_open(
             &b.title,
             by.clone(),
         );
+        new.validate()?;
+        // Everything is checked before anything is written, so a refused open leaves nothing behind.
+        let anchors = post_anchors(&s, &b.repo, &b.on).await?;
+        let mut repos: Vec<&str> = anchors.iter().map(|a| a.repo.as_str()).collect();
+        repos.push(&b.repo);
+        let teams = s.teams.read().unwrap_or_else(|e| e.into_inner()).clone();
+        teams.accepts(&by.teams, &repos)?;
+        let mut post = match b.body.filter(|t| !t.trim().is_empty()) {
+            Some(body) => {
+                let post = crate::discussion::new_post(
+                    &new.id,
+                    b.kind.as_deref(),
+                    &body,
+                    b.evidence,
+                    anchors,
+                    by,
+                )?;
+                post.validate()?;
+                Some(post)
+            }
+            None => None,
+        };
         let (id, existing) = store.start(&new).await?;
-        if let Some(body) = b.body.filter(|t| !t.trim().is_empty()) {
-            let anchors = post_anchors(&s, &b.on).await?;
-            let repos: Vec<&str> = anchors.iter().map(|a| a.repo.as_str()).collect();
-            teams.accepts(&by.teams, &repos)?;
-            let post = crate::discussion::new_post(
-                &id,
-                b.kind.as_deref(),
-                &body,
-                b.evidence,
-                anchors,
-                by,
-            )?;
-            store.post(&post).await?;
+        if let Some(post) = post.as_mut() {
+            post.discussion = id.clone();
+            store.post(post).await?;
         }
         anyhow::Ok((id, existing))
     };
@@ -1787,7 +1797,7 @@ async fn discussion_post(
             .get(&b.discussion)
             .await?
             .with_context(|| format!("no discussion `{}`", b.discussion))?;
-        let anchors = post_anchors(&s, &b.on).await?;
+        let anchors = post_anchors(&s, &t.discussion.repo, &b.on).await?;
         let mut repos: Vec<&str> = anchors.iter().map(|a| a.repo.as_str()).collect();
         repos.push(&t.discussion.repo);
         s.teams
@@ -1812,14 +1822,18 @@ async fn discussion_post(
 }
 
 /// The anchors a post's `on` names, at the indexed commits.
-async fn post_anchors(s: &Session, on: &[String]) -> Result<Vec<crate::ledger::Anchor>> {
+async fn post_anchors(
+    s: &Session,
+    repo: &str,
+    on: &[String],
+) -> Result<Vec<crate::ledger::Anchor>> {
     let commits = match graph_uri(s) {
         Some(u) => crate::index::read_repo_commits(&u)
             .await
             .unwrap_or_default(),
         None => Default::default(),
     };
-    crate::discussion::anchors(&s.data.graph, s.data.symbols.iter(), on, &commits)
+    crate::discussion::anchors(&s.data.graph, s.data.symbols.iter(), repo, on, &commits)
 }
 
 /// Permanently delete a record and the reviews about it.

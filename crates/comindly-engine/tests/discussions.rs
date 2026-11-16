@@ -29,6 +29,7 @@ async fn why_and_preflight_name_open_discussions_on_the_code() {
     let anchors = discussion::anchors(
         &graph,
         out.symbols.iter(),
+        "courses-svc",
         &[on.id.render()],
         &HashMap::new(),
     )

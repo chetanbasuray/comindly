@@ -954,13 +954,19 @@ fn discussion(c: &Client, what: DiscussionWhat) -> ExitCode {
                 ExitCode::SUCCESS
             })
         }
-        DiscussionWhat::Read { id } => show(
-            c.get(&format!("/api/v1/discussion/{id}"), &()),
-            |t: d::Transcript| {
-                println!("{}", d::markdown(&t));
-                ExitCode::SUCCESS
-            },
-        ),
+        DiscussionWhat::Read { id } => {
+            // Ids are generated letters, digits and dashes; anything else would reach another route.
+            if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                return fail(anyhow::anyhow!("`{id}` is not a discussion id"));
+            }
+            show(
+                c.get(&format!("/api/v1/discussion/{id}"), &()),
+                |t: d::Transcript| {
+                    println!("{}", d::markdown(&t));
+                    ExitCode::SUCCESS
+                },
+            )
+        }
         DiscussionWhat::List {
             repo,
             ticket,

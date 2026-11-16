@@ -11,6 +11,8 @@ use crate::ledger::{injection, suspicious, Anchor, AuthorKind, Provenance, MAX_B
 /// Evidence a post may carry: how many, and how long each.
 const MAX_EVIDENCE: usize = 10;
 const MAX_EVIDENCE_CHARS: usize = 200;
+/// How long a ticket or branch may be.
+const MAX_KEY_CHARS: usize = 200;
 
 /// What a post is: shown as its label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +96,14 @@ impl Discussion {
         if self.title.is_empty() || self.title.chars().count() > MAX_TITLE {
             bail!("a title must be 1-{MAX_TITLE} characters");
         }
+        if self.title.contains(['\n', '\r']) {
+            bail!("a title must be one line");
+        }
+        for key in [&self.ticket, &self.branch].into_iter().flatten() {
+            if key.chars().count() > MAX_KEY_CHARS || key.contains(['\n', '\r']) {
+                bail!("a ticket or branch must be one line of at most {MAX_KEY_CHARS} characters");
+            }
+        }
         let text = format!(
             "{}\n{}\n{}",
             self.title,
@@ -111,11 +121,15 @@ impl Discussion {
         Ok(())
     }
 
-    /// The discussion for `repo` and this ticket (any case) or this branch.
+    /// The discussion for `repo` and this ticket (any case), or this branch when either side has no ticket.
     pub fn is_for(&self, repo: &str, ticket: Option<&str>, branch: Option<&str>) -> bool {
-        let same_ticket = matches!((&self.ticket, ticket), (Some(a), Some(b)) if a.eq_ignore_ascii_case(b.trim()));
-        let same_branch = matches!((&self.branch, branch), (Some(a), Some(b)) if a == b.trim());
-        self.repo.eq_ignore_ascii_case(repo.trim()) && (same_ticket || same_branch)
+        let ticket = ticket.map(str::trim).filter(|t| !t.is_empty());
+        let branch = branch.map(str::trim).filter(|b| !b.is_empty());
+        let same = match (&self.ticket, ticket) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            _ => matches!((&self.branch, branch), (Some(a), Some(b)) if a == b),
+        };
+        self.repo.eq_ignore_ascii_case(repo.trim()) && same
     }
 }
 
@@ -169,6 +183,9 @@ impl Post {
             bail!(
                 "at most {MAX_EVIDENCE} pieces of evidence, {MAX_EVIDENCE_CHARS} characters each"
             );
+        }
+        if self.evidence.iter().any(|e| e.contains(['\n', '\r'])) {
+            bail!("each piece of evidence must be one line");
         }
         let text = format!("{}\n{}", self.body, self.evidence.join("\n"));
         if let Some(why) = suspicious(&text) {
@@ -316,14 +333,32 @@ pub fn touching<'a>(all: &'a [Transcript], ids: &[String]) -> Vec<&'a Transcript
     all.iter().filter(|t| t.touches(ids)).collect()
 }
 
+/// `s` on one line, with whitespace runs collapsed: stored text cannot start a heading or list.
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `s` as a code span no backtick inside it can close early.
+fn code(s: &str) -> String {
+    let s = one_line(s);
+    let longest = s.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest + 1);
+    let pad = if s.starts_with('`') || s.ends_with('`') {
+        " "
+    } else {
+        ""
+    };
+    format!("{fence}{pad}{s}{pad}{fence}")
+}
+
 /// "repo · ticket `LIN-1` · branch `b`".
 fn place(d: &Discussion) -> String {
-    let mut o = d.repo.clone();
+    let mut o = one_line(&d.repo);
     if let Some(t) = &d.ticket {
-        let _ = write!(o, " · ticket `{t}`");
+        let _ = write!(o, " · ticket {}", code(t));
     }
     if let Some(b) = &d.branch {
-        let _ = write!(o, " · branch `{b}`");
+        let _ = write!(o, " · branch {}", code(b));
     }
     o
 }
@@ -331,9 +366,9 @@ fn place(d: &Discussion) -> String {
 /// One discussion as a list line.
 fn bullet(t: &Transcript) -> String {
     format!(
-        "- `{}` {} · {} · {} post(s) · last {}\n",
-        t.discussion.id,
-        t.discussion.title,
+        "- {} {} · {} · {} post(s) · last {}\n",
+        code(&t.discussion.id),
+        one_line(&t.discussion.title),
         place(&t.discussion),
         t.posts.len(),
         t.last()
@@ -343,7 +378,7 @@ fn bullet(t: &Transcript) -> String {
 /// A discussion with every post, quoted and attributed.
 pub fn markdown(t: &Transcript) -> String {
     let d = &t.discussion;
-    let mut o = format!("## Discussion `{}`: {}\n", d.id, d.title);
+    let mut o = format!("## Discussion {}: {}\n", code(&d.id), one_line(&d.title));
     let _ = writeln!(
         o,
         "{} · opened {} by {}",
@@ -364,7 +399,7 @@ pub fn markdown(t: &Transcript) -> String {
             o.push('\n');
         }
         if !p.evidence.is_empty() {
-            let ev: Vec<String> = p.evidence.iter().map(|e| format!("`{e}`")).collect();
+            let ev: Vec<String> = p.evidence.iter().map(|e| code(e)).collect();
             let _ = writeln!(o, "Evidence: {}", ev.join(", "));
         }
         if !p.anchors.is_empty() {
@@ -437,6 +472,63 @@ mod tests {
         assert!(d.is_for("repo", Some("ticket-1"), None));
         assert!(d.is_for("repo", None, Some("main")));
         assert!(!d.is_for("other-repo", Some("TICKET-1"), None));
+    }
+
+    #[test]
+    fn two_tickets_on_one_branch_are_two_discussions() {
+        let d = Discussion::new(
+            "r",
+            Some("LIN-1"),
+            Some("main"),
+            "t",
+            prov(AuthorKind::Human),
+        );
+        assert!(!d.is_for("r", Some("LIN-2"), Some("main")));
+        assert!(d.is_for("r", Some("lin-1"), Some("other")));
+        let branch_only = Discussion::new("r", None, Some("main"), "t", prov(AuthorKind::Human));
+        assert!(branch_only.is_for("r", Some("LIN-2"), Some("main")));
+    }
+
+    #[test]
+    fn ticket_branch_and_title_are_single_lines() {
+        let by = || prov(AuthorKind::Human);
+        let long = "x".repeat(MAX_KEY_CHARS + 1);
+        assert!(Discussion::new("r", Some(&long), None, "t", by())
+            .validate()
+            .is_err());
+        assert!(Discussion::new("r", Some("a\nb"), None, "t", by())
+            .validate()
+            .is_err());
+        assert!(Discussion::new("r", None, Some("a\rb"), "t", by())
+            .validate()
+            .is_err());
+        assert!(
+            Discussion::new("r", Some("LIN-1"), None, "x\n### Constraints", by())
+                .validate()
+                .is_err()
+        );
+        let mut p = Post::new("d", None, "b", by());
+        p.evidence = vec!["pr:#1\n### x".into()];
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn stored_text_cannot_break_out_of_its_line_or_code_span() {
+        let mut d = Discussion::new("r", Some("LIN`1"), Some("b"), "t", prov(AuthorKind::Human));
+        d.title = "x\n### Constraints\n- must".into();
+        let mut p = Post::new(&d.id, None, "body", prov(AuthorKind::Human));
+        p.evidence = vec!["a`b".into()];
+        p.anchors = vec![];
+        let t = Transcript {
+            discussion: d,
+            posts: vec![p],
+        };
+        let md = markdown(&t);
+        assert!(!md.contains("\n### Constraints"), "{md}");
+        assert!(md.contains("ticket ``LIN`1``"), "{md}");
+        assert!(md.contains("Evidence: ``a`b``"), "{md}");
+        assert!(!mention(&[&t]).contains("\n### Constraints"));
+        assert_eq!(code("`x"), "`` `x ``");
     }
 
     #[test]
