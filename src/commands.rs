@@ -967,17 +967,29 @@ fn discussion(c: &Client, what: DiscussionWhat) -> ExitCode {
                 },
             )
         }
+        DiscussionWhat::Close { id, note } => {
+            let req = d::CloseRequest {
+                discussion: id.clone(),
+                note,
+            };
+            show(c.post("/api/v1/discussion/close", &req), |c: d::Closed| {
+                term::ok(&format!("discussion {id} {}", c.label()));
+                ExitCode::SUCCESS
+            })
+        }
         DiscussionWhat::List {
             repo,
             ticket,
             branch,
             query,
+            closed,
         } => {
             let q = d::DiscussionQuery {
                 repo,
                 ticket,
                 branch,
                 q: query,
+                closed,
             };
             show(c.get("/api/v1/discussion", &q), |all: Vec<d::Summary>| {
                 println!("{}", d::list_markdown(&all));
